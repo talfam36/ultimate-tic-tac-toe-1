@@ -1,0 +1,115 @@
+name: Solve Ultimate Tic-Tac-Toe
+
+on:
+  workflow_dispatch:
+    inputs:
+      moves:
+        description: 'Move history, e.g. "ee ea ab". Blank = initial position.'
+        required: false
+        default: ''
+        type: string
+      target:
+        description: 'Exact win claim'
+        required: true
+        default: both
+        type: choice
+        options: [both, X, O]
+      chunk_minutes:
+        description: 'Minutes per target for this run (max 330)'
+        required: true
+        default: '330'
+        type: string
+      checkpoint_id:
+        description: 'Reuse this name to continue the same proof'
+        required: true
+        default: root
+        type: string
+      fresh:
+        description: 'Ignore previous checkpoint'
+        required: true
+        default: false
+        type: boolean
+      max_nodes:
+        description: 'Optional TT-node cap; 0 = unlimited'
+        required: true
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uttt-proof-${{ inputs.checkpoint_id }}
+  cancel-in-progress: false
+
+jobs:
+  prove:
+    strategy:
+      fail-fast: false
+      matrix:
+        player: [X, O]
+    if: ${{ inputs.target == 'both' || inputs.target == matrix.player }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and self-test
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j2
+          ctest --test-dir build --output-on-failure
+
+      - name: Restore proof checkpoint
+        if: ${{ !inputs.fresh }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .solver-state/${{ matrix.player }}.tt
+          key: uttt-${{ inputs.checkpoint_id }}-${{ matrix.player }}-${{ github.run_id }}
+          restore-keys: |
+            uttt-${{ inputs.checkpoint_id }}-${{ matrix.player }}-
+
+      - name: Search exact proof
+        id: solve
+        shell: bash
+        env:
+          PLAYER: ${{ matrix.player }}
+          MOVES: ${{ inputs.moves }}
+          CHUNK_MINUTES: ${{ inputs.chunk_minutes }}
+          MAX_NODES: ${{ inputs.max_nodes }}
+        run: |
+          set -euo pipefail
+          mkdir -p .solver-state
+          [[ "$CHUNK_MINUTES" =~ ^[0-9]+$ ]] || { echo "chunk_minutes must be an integer"; exit 2; }
+          [[ "$MAX_NODES" =~ ^[0-9]+$ ]] || { echo "max_nodes must be an integer"; exit 2; }
+          (( CHUNK_MINUTES >= 1 )) || { echo "chunk_minutes must be >= 1"; exit 2; }
+          (( CHUNK_MINUTES > 330 )) && CHUNK_MINUTES=330
+          seconds=$((CHUNK_MINUTES * 60))
+          tt=".solver-state/$PLAYER.tt"
+          args=(--target "$PLAYER" --time "$seconds" --max-nodes "$MAX_NODES" --show --save-tt "$tt")
+          [[ -s "$tt" ]] && args+=(--load-tt "$tt")
+          [[ -n "$MOVES" ]] && args+=(--moves "$MOVES")
+
+          set +e
+          ./build/uttt-solve "${args[@]}" 2>&1 | tee "solve-$PLAYER.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo "## $PLAYER proof run"
+            echo
+            echo '~~~text'
+            cat "solve-$PLAYER.log"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # exit 3 means exact search is still unresolved, not that the workflow failed.
+          (( rc == 0 || rc == 3 )) || exit "$rc"
+
+      - name: Save proof checkpoint
+        if: ${{ always() && steps.solve.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .solver-state/${{ matrix.player }}.tt
+          key: uttt-${{ inputs.checkpoint_id }}-${{ matrix.player }}-${{ github.run_id }}
