@@ -1,0 +1,4 @@
+/build/
+/.solver-state/
+*.tt
+*.log
